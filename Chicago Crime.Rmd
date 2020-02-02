@@ -1,0 +1,293 @@
+---
+title: "Assignment3"
+author: "PanRui (Echo)"
+date: "July 14, 2019"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r chunk_example5, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(dplyr)
+library(jsonlite)
+library(lubridate)
+library(sf)
+library(ggplot2)
+library(tidycensus)
+library (MASS) 
+library(lmtest)
+```
+
+
+# Session1
+
+## 1.1 To get the crime data 
+
+```{r}
+thefts<-tibble()
+for(i in 2016:2019){
+  url <- paste0("https://data.cityofchicago.org/resource/ijzp-q8t2.json?primary_type=THEFT",
+                "&year=",i,"&$limit=100000")
+  url1<-read_json(url,simplifyVector = TRUE)[ ,-22]
+  thefts<-bind_rows(thefts, url1)
+}
+```
+
+## 1.2
+```{r}
+thefts <- thefts %>%  # Pull time out as different columns.
+  mutate(thefts_time = as.POSIXct(ymd_hms(date)),
+         year = year(thefts_time),
+         month = month(thefts_time),
+         day = day(thefts_time),
+         week = week(thefts_time),
+         hour = hour(thefts_time),
+  ) %>% drop_na(latitude,longitude)
+```
+
+
+## 1.3
+```{r}
+thefts <- thefts %>%
+  mutate(category = ifelse(description == "$500 AND UNDER" | description =="pocket-picking" 
+                           |description == "pursesnatching","petty","grand"))
+```
+
+
+# Section 2
+## 2.1
+```{r thefts}
+thefts <- st_as_sf(
+  thefts,
+  coords = c("longitude", "latitude"),
+  crs = 4326,
+  remove = FALSE)
+
+```
+
+## 2.2
+Filter the data which is in the last 9 months. 
+```{r }
+
+# Here I pull out data in last 2 months.
+
+thefts_fill <- thefts %>%  
+  filter(difftime(now(),thefts_time,units = "days") < 270)
+
+ggplot() +
+  geom_sf(data = thefts_fill, aes(color = category),
+          show.legend = "point", size = 0.3, alpha = 0.5) + 
+  scale_color_manual(name = "Theft Category", 
+                     values = c("red", "blue"), label = c("Grand", "Pretty"))+
+  theme_void() +
+  labs(title = "Thefts in Chicago (Previous 270 Days)",
+       caption="Source: City of Chicago Data Portal") +
+  guides(colour = guide_legend(override.aes = list(size = 4)))
+  
+
+```
+
+## 2.3
+```{r thefts_fill plot,message=FALSE, results="hide"}
+
+vars <- load_variables(2016, "acs5")
+
+cook <- get_acs(
+  geography = "tract",
+  county = "Cook",
+  state = "IL",
+  geometry = TRUE,
+  variables = c(total_pop = "B01001_001"),
+  year = 2016
+) 
+
+cook <- st_transform(cook, 4326)
+
+thefts_merged <- st_join(    # Merge total population in cook and thefts info together.
+  thefts,    # points
+  cook,        # polygons
+  join = st_within) 
+
+```
+
+
+## 2.4 
+```{r acs_data plot, warning=FALSE, results="hide"}
+
+ # To set column of "geometry" NULL
+thefts_merged <- st_set_geometry(thefts_merged, NULL) 
+
+# Average thefts across the 4 years.
+data <- thefts_merged %>% 
+  group_by(GEOID) %>%
+  summarize(theft_avg = n()/4)
+
+theft_agg <- data.frame(data)
+  
+cook <- cook %>% 
+  left_join(theft_agg,"GEOID") %>% 
+  na.omit(cook)
+
+# Further divided by total populatoin, which is "estimate"
+cook <- cook %>%
+  mutate(thefts_pc = theft_avg/estimate) %>% 
+  arrange(desc(thefts_pc))
+
+# Do the plot
+cook %>% 
+  ggplot() +
+    geom_sf(aes(fill = thefts_pc, color = thefts_pc)) +
+    scale_color_distiller(palette = "Spectral", guide = FALSE) +
+    scale_fill_distiller(palette = "Spectral", name = "Avg. Thefts\nPer Capita\nPer Year") +
+    theme_void()+
+  labs(title = "Thefts in Chicago (2016 - 2019)",
+       caption="Source: City of Chicago Data Portal")
+
+
+```
+
+# Secton 3
+
+We have 852 observations for data "theft_data", after delete the rows with NA value, we finally get 823 observations, which is the data we will do regression on.
+
+I add a new variable -- gini_index as a measure of inequality, which I think is part of the reason a district has more social problems.
+
+Here is to show only the basic regression with every independent variable required in the assignment. I will try to better design it afterwards.
+
+```{r,message=FALSE, results="hide"}
+vars <- load_variables(2016, "acs5")
+
+theft_data <- get_acs(  
+  geography = "tract",
+  county = "Cook",
+  state = "IL",
+  variables = c(total_pop = "B01001_001", 
+                median_houseincome = "B25099_001", 
+                white = "B02001_002", 
+                bachelor = "B21003_006", 
+                poverty = "B17020_003",
+                gini_index = "B19083_001"),
+  year = 2016
+)
+
+theft_data <- theft_data[,-5] %>% # To delete the column of "moe"
+  group_by(GEOID) %>% 
+  spread(variable, estimate)
+
+theft_data <- theft_data %>% 
+  mutate(white_pct = white/total_pop) %>% 
+  mutate(poverty_pct = poverty/total_pop) %>% 
+  mutate(bachelor_pct = bachelor/total_pop)
+
+
+# Combine theft related data(independent variables) with thefts(dependent variable)  
+
+theft_data <- cook %>%  
+  left_join(theft_data,"GEOID") %>% 
+  na.omit(theft_data)      # Delete rows with NA value
+
+theft_reg <- lm(thefts_pc ~ bachelor_pct + median_houseincome
+                + white_pct + poverty_pct + gini_index, data = theft_data)
+
+
+summary(theft_reg)
+
+```
+It is reasonable to add an interaction term of *median house income* and *percent below poverty*, because there might be correlation. 
+
+```{r}
+
+theft_reg1 <- lm(thefts_pc ~ bachelor_pct + median_houseincome*poverty_pct
+                 + white_pct + gini_index, data = theft_data)
+
+summary(theft_reg1)
+
+```
+
+Try to figure out a better fit regression by using stepwise regression. This step is to see which of the variables should be kept in the model. 
+
+```{r warning = FALSE}
+stepAIC(theft_reg1, direction = "backward")
+
+```
+
+The *median house income*,*percent below poverty*,*median house income***percent below poverty*, *percent white*,*gini index* are reserved in the new regression. 
+
+## Questions
+
+## 3.1
+**Weight**
+To consider whether weight or not, there are at least two factors that I can think of. 
+(1) If we are planning to calculate a descriptive statistic of true value, then sampling weights can be reasonable. But here, we are acutally trying to estimate causal effects, so we use weights for another consideration.
+(2) The basic motivation to use weights is to do weighted least squares (WLS) in order to deal with heteroskedasticity in error terms, so as to increase precision. 
+So we should do heteroskedasticity test to see if there is heteroskedasticity problem. Then estimate the format of heteroskedasticity, such as $Var(u|x)=\sigma^2h(x_i)$(where $h(x_i)$ is the function of independent variables and we should estimate it). Then we can do regression with the weight $1/\hat{h(x_i)}$.
+```{r}
+bptest(theft_reg)
+```
+As we can see, p-value < 0.05 and even <0.01, so there is heteroskedasticity problem. It is reasonable to use weighted regression.
+
+Here is the code to do weighted regression, I I don't choose to run it.
+
+```{r  eval=FALSE}
+res <- residuals(theft_reg)
+ressq <- res^2
+lnressq <- log(ressq)
+theft_data <- theft_data %>% 
+  mutate(lnressq)
+
+aux <- lm(lnressq ~ bachelor_pct + median_houseincome*poverty_pct + 
+            white_pct + gini_index, data = theft_data)
+ghat <- fitted(aux)
+hhat <- exp(ghat)
+theft_data <- theft_data %>% 
+  mutate(hhat)
+theft_reg_1 <- lm(thefts_pc ~ bachelor_pct + median_houseincome*poverty_pct + 
+                    white_pct + gini_index, weights = hhat,data = theft_data)
+summary(theft_reg_1)
+
+```
+
+**Fixed effect**
+We could include fixed effect it this regression, because there are some factors that might change with time, but are the same for all individuals(individual invariant unobservables), like the economic situation change with time, but almost the same across differnet counties. There might also be things that did not vary over time for the same cross-sectional entity.
+
+
+**Interactions**
+For those elements having correlation, we might put interactions in the regression. 
+Here, we may put the interactions term of *median house income* and *percent below the poverty line*, because they are both based on the economic situation, so might have correlatoin. 
+```{r}
+
+theft_reg <- lm(thefts_pc ~ bachelor_pct + median_houseincome*poverty_pct + 
+                  white_pct + gini_index, data = theft_data)
+summary(theft_reg)
+
+```
+
+
+**Missing values**
+Delete the observations with missing values in the variables we care about.
+
+After the analysis here, here is the new more fitted regression I try to make: 
+
+
+## 3.2
+From the Stepward regression outcome reported above, the variables of *median house income*, *percent below the poverty line*,the interaction term of both,  *percent of white*,*gini index*  are reasonable to include in the regression. 
+
+The coefficients of *median house income* and *percent of white* are significant on the 0.00 significant level, and *median_houseincome:poverty_pct* is significant on 0.001 level. *percent below the poverty line* is significant on the 0.01 significant level. So the coefficients of them are reasonable.
+
+*percent of bachelor degree* is not significant on 0.1 significant level.
+
+The coefficient of *gini index* is the biggest, which is 3.589e-02. So gini index most influences number of thefts.
+
+
+## 3.3 
+I think the regression should also include some basic demographic information, such as sex, age, educationl year, unemployment,ect, in order to control different demographic character of differnet counties.
+
+I don't think this regression can be interpreted as casual, because so many factors are not included in the model, which might be the confounding factors. The confounding factors maybe how well each county governs, which both influences the economic & employment and the public security. And there can be also several culture or other longtime social problems, which are quite different in different parts. 
+
